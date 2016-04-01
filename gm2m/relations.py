@@ -15,7 +15,7 @@ from .compat import resolve_related_class
 from .contenttypes import ct, get_content_type
 from .models import create_gm2m_intermediary_model, THROUGH_FIELDS
 from .managers import create_gm2m_related_manager
-from .descriptors import GM2MRelatedDescriptor, ReverseGM2MRelatedDescriptor
+from .descriptors import RelatedGM2MDescriptor, SourceGM2MDescriptor
 from .deletion import *
 from .signals import deleting
 from .helpers import GM2MTo, is_fake_model
@@ -61,7 +61,7 @@ class GM2MRelation(ForeignObject):
     one_to_one = False
 
     concrete = False
-    related_accessor_class = GM2MRelatedDescriptor
+    related_accessor_class = RelatedGM2MDescriptor
 
     hidden = False
 
@@ -139,9 +139,11 @@ class GM2MUnitRel(ForeignObjectRel):
 
     dummy_pre_delete = lambda s, **kwargs: None
 
-    def __init__(self, field, to):
+    def __init__(self, field, to, auto):
         super(GM2MUnitRel, self).__init__(field, to)
         self.multiple = True
+        # warning: do NOT use self.auto_created as it's used by Django !!
+        self.auto = auto
 
     def check(self, **kwargs):
         errors = []
@@ -332,14 +334,14 @@ class GM2MUnitRel(ForeignObjectRel):
         if not self.is_hidden() and not self.field.model._meta.swapped:
             setattr(self.to, self.related_name
                         or (self.field.model._meta.model_name + '_set'),
-                    GM2MRelatedDescriptor(self.related, self))
+                    RelatedGM2MDescriptor(self.related, self))
 
     @cached_property
     def related_manager_cls(self):
         # the related manager class getter is implemented here rather than in
         # the descriptor as we may need to access it even for hidden relations
         return create_gm2m_related_manager(
-            superclass=self.to._default_manager.__class__,
+            superclass=self.field.model._default_manager.__class__,
             field=self.related.field,
             model=self.field.model,
             through=self.through,
@@ -457,19 +459,19 @@ class GM2MRel(ManyToManyRel):
         for model in related_models:
             self.add_relation(model, contribute_to_class=False)
 
-    def add_relation(self, model, contribute_to_class=True):
+    def add_relation(self, model, contribute_to_class=True, auto=False):
         try:
             assert not model._meta.abstract, \
             "%s cannot define a relation with abstract class %s" \
             % (self.field.__class__.__name__, model._meta.object_name)
         except AttributeError:
-            # to._meta doesn't exist, so it must be a string
+            # model._meta doesn't exist, so it must be a string
             assert isinstance(model, six.string_types), \
             '%s(%r) is invalid. First parameter to GM2MField must ' \
             'be either a model or a model name' \
             % (self.field.__class__.__name__, model)
 
-        rel = GM2MUnitRel(self.field, model)
+        rel = GM2MUnitRel(self.field, model, auto)
         self.rels.append(rel)
         if contribute_to_class:
             rel.contribute_to_class()
@@ -688,7 +690,7 @@ class GM2MRel(ManyToManyRel):
 
         # Connect the descriptor for this field
         setattr(cls, self.field.attname,
-                ReverseGM2MRelatedDescriptor(self.field))
+                SourceGM2MDescriptor(self.field))
 
         if cls._meta.abstract or cls._meta.swapped:
             # do not do anything for abstract or swapped model classes
@@ -780,6 +782,11 @@ class GM2MRel(ManyToManyRel):
         self.related_model = cls
 
         for rel in self.rels:
+            # we need to make sure the GM2MUnitRel's field instance is the
+            # right one. Indeed, if cls is derived from an abstract model
+            # where the GM2MField is defined, rel.field is the field linked
+            # to the abstract model
+            rel.field = self.field
             rel.contribute_to_class()
 
     @cached_property
